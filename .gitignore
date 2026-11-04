@@ -1,0 +1,3 @@
+build/
+*.AppImage
+*.tar.gz

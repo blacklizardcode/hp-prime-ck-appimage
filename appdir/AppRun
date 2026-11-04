@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# AppRun for the HP Prime Connectivity Kit AppImage.
+#
+# Runs HP's Windows Connectivity Kit through a bundled, portable Wine build.
+# On first launch it creates a private Wine prefix and installs the bundled
+# VC++ runtime + Connectivity Kit MSI into it; later launches start the app directly.
+#
+# Run with --help for all options.
+
+set -uo pipefail
+
+HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+APP_NAME="HP Prime Connectivity Kit"
+PAYLOAD="$HERE/payload"
+WINE_DIR="$HERE/opt/wine"
+
+DATA_DIR="${HPCK_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/hp-prime-ck}"
+export WINEPREFIX="${HPCK_PREFIX:-$DATA_DIR/prefix}"
+export WINEARCH=win64
+export WINEDEBUG="${WINEDEBUG:--all}"
+# mscoree/mshtml off: CK needs neither .NET nor IE, and this skips the Mono/Gecko popups.
+# winemenubuilder off: stops Wine writing .desktop files that point at the temporary AppImage mount.
+export WINEDLLOVERRIDES="${WINEDLLOVERRIDES:-mscoree=;mshtml=;winemenubuilder.exe=}"
+export PATH="$WINE_DIR/bin:$PATH"
+
+WINE="$WINE_DIR/bin/wine"
+WINESERVER="$WINE_DIR/bin/wineserver"
+CK_DIR="$WINEPREFIX/drive_c/Program Files/HP/HP Connectivity Kit"
+CK_EXE="$CK_DIR/ConnectivityKit.exe"
+STAMP="$WINEPREFIX/.hpck-installed"
+LOG="$DATA_DIR/hpck.log"
+UDEV_RULE_NAME="70-hp-prime.rules"
+# HP vendor id 03f0; Prime G1 = 0441, Prime G2 = 2441 (1541 reported on some units).
+PRIME_IDS_RE='^0003:000003F0:0000(0441|1541|2441)$'
+
+mkdir -p "$DATA_DIR"
+
+# ----------------------------------------------------------------------------- UI helpers
+has_display() { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }
+
+# Messages may contain "\n"; expand them to real newlines.
+log() { printf '[hp-prime-ck] %b\n' "$*" | tee -a "$LOG" >&2; }
+
+dialog() {  # dialog info|error|question "text"
+    local kind="$1" text; text="$(printf '%b' "$2")"
+    has_display || return 2
+    if command -v zenity >/dev/null; then
+        zenity --"$kind" --no-markup --title="$APP_NAME" --width=440 --text="$text" 2>/dev/null
+    elif command -v kdialog >/dev/null; then
+        case "$kind" in info) kind=msgbox ;; question) kind=yesno ;; esac
+        kdialog --title "$APP_NAME" --"$kind" "$text" 2>/dev/null
+    elif [ "$kind" != question ] && command -v notify-send >/dev/null; then
+        notify-send "$APP_NAME" "$text"
+    else
+        return 2
+    fi
+}
+
+info()  { log "$*"; dialog info "$*"; return 0; }
+error() { log "ERROR: $*"; dialog error "$*"; return 0; }
+
+ask() {  # yes/no question, returns 0 on yes
+    local rc a
+    if [ -t 0 ]; then
+        read -r -p "$(printf '%b' "$*") [y/N] " a; [[ "$a" =~ ^[Yy] ]]; return
+    fi
+    dialog question "$*"; rc=$?
+    [ $rc = 0 ]
+}
+
+# A pulsating progress window (if zenity exists) fed through fd 3.
+progress_open() {
+    if has_display && command -v zenity >/dev/null; then
+        exec 3> >(zenity --progress --pulsate --no-cancel --auto-close --width=420 \
+                         --title="$APP_NAME" --text="$1" 2>/dev/null)
+    else
+        exec 3>/dev/null
+    fi
+    log "$1"
+}
+progress_text()  { printf '# %s\n' "$1" >&3 2>/dev/null; log "$1"; }
+progress_close() { printf '100\n' >&3 2>/dev/null; exec 3>&-; }
+
+# ----------------------------------------------------------------------------- wine helpers
+wine_run()  { "$WINE" "$@" >>"$LOG" 2>&1; }
+wine_wait() { "$WINESERVER" -w; }
+
+reg_add() { wine_run reg add "$@" /f; }
+
+init_prefix() {
+    if [ ! -f "$WINEPREFIX/system.reg" ]; then
+        progress_text "Creating Wine prefix…"
+        mkdir -p "$WINEPREFIX"
+        wine_run wineboot --init
+        wine_wait
+    fi
+    progress_text "Configuring Wine…"
+    # Act like Windows 10 (what the CK targets).
+    reg_add 'HKCU\Software\Wine' /v Version /d win10
+    # Smoother (sub-pixel) font rendering for the Qt UI.
+    reg_add 'HKCU\Control Panel\Desktop' /v FontSmoothing /d 2
+    reg_add 'HKCU\Control Panel\Desktop' /v FontSmoothingType /t REG_DWORD /d 2
+    reg_add 'HKCU\Control Panel\Desktop' /v FontSmoothingGradientOrientation /t REG_DWORD /d 1
+    # Make sure the hidraw backend (how the calculator's USB HID interface reaches Windows apps) is on.
+    reg_add 'HKLM\System\CurrentControlSet\Services\winebus' /v DisableHidraw /t REG_DWORD /d 0
+    # Prefer the real MSVC runtime (installed below) over Wine's re-implementation.
+    local d
+    for d in concrt140 msvcp140 msvcp140_1 msvcp140_2 msvcp140_atomic_wait msvcp140_codecvt_ids \
+             vcamp140 vccorlib140 vcomp140 vcruntime140 vcruntime140_1; do
+        reg_add 'HKCU\Software\Wine\DllOverrides' /v "$d" /d native,builtin
+    done
+    wine_wait
+}
+
+# install_ck [installer]   installer may be an .msi or HP's bundle .exe; default = bundled payload
+install_ck() {
+    local src="${1:-}"
+    : >"$LOG"
+    progress_open "Setting up the $APP_NAME (first run, takes a minute)…"
+    init_prefix
+
+    if [ -z "$src" ]; then
+        if [ -f "$PAYLOAD/VC_redist.x64.exe" ]; then
+            progress_text "Installing Microsoft Visual C++ runtime…"
+            wine_run "$PAYLOAD/VC_redist.x64.exe" /q /norestart
+            wine_wait
+        fi
+        progress_text "Installing HP Connectivity Kit $(cat "$PAYLOAD/VERSION" 2>/dev/null)…"
+        wine_run msiexec /i "$PAYLOAD/ConnectivityKit.msi" /qn /norestart
+        wine_wait
+    else
+        case "${src,,}" in
+            *.msi)
+                progress_text "Installing $(basename "$src")…"
+                wine_run msiexec /i "$src" /qn /norestart ;;
+            *)
+                # HP's full bundle (WiX Burn). Show its own UI, which is the most reliable under Wine.
+                progress_close
+                log "Running installer $src"
+                wine_run "$src"
+                progress_open "Finishing…" ;;
+        esac
+        wine_wait
+    fi
+    progress_close
+
+    sync_patched_dlls
+    if [ -f "$CK_EXE" ]; then
+        if [ -z "$src" ]; then cat "$PAYLOAD/VERSION" >"$STAMP" 2>/dev/null; else echo "custom: $src" >"$STAMP"; fi
+        log "Installed OK."
+        return 0
+    fi
+    error "Installing the Connectivity Kit failed.\n\nSee the log: $LOG"
+    return 1
+}
+
+to_win_path() { "$WINE_DIR/bin/winepath" -w "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# ----------------------------------------------------------------------------- USB helpers
+prime_hidraw_nodes() {  # prints /dev/hidrawN for each connected Prime
+    local h id
+    for h in /sys/class/hidraw/hidraw*; do
+        [ -e "$h/device/uevent" ] || continue
+        id="$(sed -n 's/^HID_ID=//p' "$h/device/uevent" 2>/dev/null)"
+        [[ "${id^^}" =~ $PRIME_IDS_RE ]] && echo "/dev/$(basename "$h")"
+    done
+}
+
+check_usb() {  # quiet=1: only complain when something is wrong
+    local quiet="${1:-0}" n bad=()
+    local nodes; nodes="$(prime_hidraw_nodes)"
+    if [ -z "$nodes" ]; then
+        [ "$quiet" = 1 ] || info "No HP Prime found on USB.\n\nConnect the calculator (switched on) and try again.\nThe virtual calculator / offline features work without one."
+        return 0
+    fi
+    for n in $nodes; do [ -r "$n" ] && [ -w "$n" ] || bad+=("$n"); done
+    if [ ${#bad[@]} -gt 0 ]; then
+        if ask "An HP Prime is connected, but your user can't access ${bad[*]}.\n\nInstall a udev rule so the Connectivity Kit can talk to it? (asks for your password)"; then
+            setup_usb
+        fi
+    elif [ "$quiet" != 1 ]; then
+        info "HP Prime found on: $nodes\nPermissions look good."
+    fi
+}
+
+setup_usb() {
+    local dest="/etc/udev/rules.d/$UDEV_RULE_NAME" tmp rc
+    # Copy the rule out of the AppImage mount first: root can't read another user's FUSE mount.
+    tmp="$(mktemp)"; cp "$HERE/$UDEV_RULE_NAME" "$tmp"; chmod 644 "$tmp"
+    local cmd="install -m 0644 '$tmp' '$dest' && udevadm control --reload-rules && udevadm trigger --subsystem-match=hidraw --subsystem-match=usb"
+    log "Installing $dest"
+    if [ "$(id -u)" = 0 ]; then sh -c "$cmd"
+    elif [ -t 0 ] && command -v sudo >/dev/null; then sudo sh -c "$cmd"
+    elif has_display && command -v pkexec >/dev/null; then pkexec sh -c "$cmd"
+    elif command -v sudo >/dev/null; then sudo sh -c "$cmd"
+    else error "Need root. Run as root:\n  $cmd"; return 1
+    fi
+    rc=$?; rm -f "$tmp"
+    if [ $rc = 0 ]; then
+        info "USB rule installed ($dest).\n\nUnplug and re-plug the calculator."
+    else
+        error "Installing the udev rule failed."
+    fi
+    return $rc
+}
+
+install_desktop() {
+    local self="${APPIMAGE:-}" apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+    local icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/256x256/apps"
+    [ -n "$self" ] || { error "--install-desktop only works when run from the .AppImage file."; return 1; }
+    mkdir -p "$apps" "$icons"
+    cp "$HERE/hp-prime-ck.png" "$icons/hp-prime-ck.png"
+    sed -e "s|^Exec=AppRun|Exec=\"$self\"|" "$HERE/hp-prime-ck.desktop" >"$apps/hp-prime-ck.desktop"
+    command -v update-desktop-database >/dev/null && update-desktop-database "$apps" 2>/dev/null
+    info "Added \"$APP_NAME\" to your application menu."
+}
+
+usage() {
+    cat <<EOF
+$APP_NAME (Wine $("$WINE" --version 2>/dev/null | sed 's/^wine-//'), AppImage)
+
+Usage: ${APPIMAGE:-$0} [option] [files...]
+
+  (no option)          Start the Connectivity Kit (first run installs it). Files are passed to it.
+  --setup-usb          Install the udev rule that lets the CK access the HP Prime over USB.
+  --check-usb          Check whether a connected HP Prime is visible and accessible.
+  --install-desktop    Add a menu entry + icon for this AppImage.
+  --scale [N|auto]     UI scale for HiDPI screens, e.g. 1.5, 2 or 150%. Default "auto"
+                       follows your desktop's scaling. Without N: show the current setting.
+  --reinstall          Re-install the bundled Connectivity Kit into the existing prefix.
+  --installer FILE     Install/update from another HP installer (.exe bundle or .msi),
+                       e.g. a newer CK or the HP Prime Virtual Calculator.
+  --winecfg            Open Wine's configuration for this prefix.
+  --wine ARGS...       Run the bundled wine with ARGS in this prefix.
+  --reset              Delete the Wine prefix (your CK settings/content inside it are lost).
+  --help               This text.
+
+Environment:
+  HPCK_PREFIX   Wine prefix to use (default: $DATA_DIR/prefix)
+  HPCK_SCALE    UI scale for this run (overrides --scale), e.g. 1.75
+  WINEDEBUG     Wine debug channels (default: -all)
+
+Prefix: $WINEPREFIX
+Log:    $LOG
+EOF
+}
+
+reinstall_ck() {
+    : >"$LOG"
+    log "Removing the installed Connectivity Kit…"
+    wine_run msiexec /x "$PAYLOAD/ConnectivityKit.msi" /qn
+    wine_wait
+    rm -f "$STAMP"
+    install_ck
+}
+
+# Install on first run; upgrade when this AppImage carries a different CK version than the prefix.
+# (A CK installed via --installer is left alone.)
+# Wine copies its builtin DLLs into the prefix; keep our patched windows.ui.dll there
+# (see patch-windows-ui.py: without it the CK aborts at startup).
+sync_patched_dlls() {
+    local f src dst
+    for f in windows.ui.dll; do
+        src="$WINE_DIR/lib/wine/x86_64-windows/$f" dst="$WINEPREFIX/drive_c/windows/system32/$f"
+        [ -f "$src" ] && [ -f "$dst" ] && ! cmp -s "$src" "$dst" && cp -f "$src" "$dst" && log "Updated $f in prefix"
+    done
+    return 0
+}
+
+# ----------------------------------------------------------------------------- HiDPI
+# Wine renders at 96 DPI unless told otherwise, which makes the CK tiny on HiDPI screens.
+# Wine's LogPixels setting scales the CK cleanly (fonts, icons and layout), so map the desktop scale onto it.
+SCALE_FILE="$DATA_DIR/scale"
+
+dpi_from_scale() { awk -v s="$1" 'BEGIN { if (s ~ /%$/) s = substr(s, 1, length(s)-1) / 100; else if (s+0 > 10) s = s / 100;
+                                         d = int(96 * s + 0.5); if (d < 72 || d > 480) exit 1; print d }'; }
+
+detect_dpi() {
+    local v
+    # 1. explicit choice: HPCK_SCALE env, or --scale saved earlier
+    v="${HPCK_SCALE:-$(cat "$SCALE_FILE" 2>/dev/null)}"
+    if [ -n "$v" ] && [ "$v" != auto ]; then dpi_from_scale "$v" && return; fi
+    # 2. Xft.dpi (GNOME/KDE/Xfce/Cinnamon on X11, KDE on Wayland)
+    if command -v xrdb >/dev/null; then
+        v="$(xrdb -query 2>/dev/null | awk '/^Xft.dpi:/ { printf "%d", $2 + 0.5 }')"
+        if [ -n "$v" ] && [ "$v" -gt 96 ] 2>/dev/null; then echo "$v"; return; fi
+    fi
+    # 3. KDE Plasma (Wayland): scale applied to XWayland apps
+    for v in kreadconfig6 kreadconfig5; do
+        if command -v "$v" >/dev/null; then
+            v="$("$v" --file kwinrc --group Xwayland --key Scale 2>/dev/null)"
+            if [ -n "$v" ] && awk -v s="$v" 'BEGIN { exit !(s > 1) }'; then dpi_from_scale "$v" && return; fi
+            break
+        fi
+    done
+    # 4. GNOME: largest monitor scale (monitors.xml) or integer scaling-factor, times text scaling.
+    #    On Wayland, mutter already upscales X11 apps unless "xwayland-native-scaling" is enabled.
+    local s=1 t=1
+    if [ "${XDG_SESSION_TYPE:-}" = wayland ] && command -v gsettings >/dev/null \
+       && ! gsettings get org.gnome.mutter experimental-features 2>/dev/null | grep -q xwayland-native-scaling; then
+        echo 96; return
+    fi
+    v="$(sed -n 's:.*<scale>\([0-9.]*\)</scale>.*:\1:p' "${XDG_CONFIG_HOME:-$HOME/.config}/monitors.xml" 2>/dev/null | sort -g | tail -1)"
+    [ -n "$v" ] && s="$v"
+    if command -v gsettings >/dev/null; then
+        v="$(gsettings get org.gnome.desktop.interface scaling-factor 2>/dev/null | awk '{print $NF}')"
+        if [ -n "$v" ] && [ "$v" -gt 1 ] 2>/dev/null; then s="$v"; fi
+        t="$(gsettings get org.gnome.desktop.interface text-scaling-factor 2>/dev/null)"; t="${t:-1}"
+    fi
+    dpi_from_scale "$(awk -v s="$s" -v t="$t" 'BEGIN { print s * t }')" && return
+    echo 96
+}
+
+apply_dpi() {
+    local dpi; dpi="$(detect_dpi)"
+    [ "$(cat "$WINEPREFIX/.hpck-dpi" 2>/dev/null)" = "$dpi" ] && return 0
+    log "Display scaling: setting Wine DPI to $dpi ($(awk -v d="$dpi" 'BEGIN { printf "%d%%", d / 96 * 100 + 0.5 }'))"
+    reg_add 'HKCU\Control Panel\Desktop' /v LogPixels /t REG_DWORD /d "$dpi"
+    reg_add 'HKLM\System\CurrentControlSet\Hardware Profiles\Current\Software\Fonts' /v LogPixels /t REG_DWORD /d "$dpi"
+    wine_wait
+    echo "$dpi" >"$WINEPREFIX/.hpck-dpi"
+}
+
+set_scale() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then
+        echo "Current: $(cat "$SCALE_FILE" 2>/dev/null || echo auto) -> $(detect_dpi) DPI"; return 0
+    fi
+    if [ "$v" = auto ]; then rm -f "$SCALE_FILE"
+    else dpi_from_scale "$v" >/dev/null || { error "Invalid scale '$v'. Use e.g. 1.5, 2, 150% or auto."; return 1; }
+         echo "$v" >"$SCALE_FILE"
+    fi
+    apply_dpi
+    info "Scale set to $v ($(detect_dpi) DPI). Restart the Connectivity Kit to see it."
+}
+
+ensure_installed() {
+    [ -f "$CK_EXE" ] || { install_ck; return; }
+    local have; have="$(cat "$STAMP" 2>/dev/null)"
+    case "$have" in custom:*) return 0 ;; esac
+    if [ -f "$PAYLOAD/VERSION" ] && [ "$have" != "$(cat "$PAYLOAD/VERSION")" ]; then
+        log "Upgrading Connectivity Kit ${have:-?} -> $(cat "$PAYLOAD/VERSION")"
+        install_ck || true   # the MSI's MajorUpgrade replaces the old version in place
+    fi
+    [ -f "$CK_EXE" ]
+}
+
+# ----------------------------------------------------------------------------- main
+case "${1:-}" in
+    -h|--help)        usage ;;
+    --setup-usb)      setup_usb ;;
+    --check-usb)      check_usb 0 ;;
+    --scale)          [ -f "$WINEPREFIX/system.reg" ] || { error "Start the Connectivity Kit once first."; exit 1; }
+                      set_scale "${2:-}" ;;
+    --install-desktop) install_desktop ;;
+    --reinstall)      reinstall_ck ;;
+    --installer)
+        [ -f "${2:-}" ] || { error "--installer needs an existing file"; exit 1; }
+        install_ck "$(readlink -f "$2")" ;;
+    --winecfg)        "$WINE" winecfg; wine_wait ;;
+    --wine)           shift; "$WINE" "$@"; rc=$?; wine_wait; exit $rc ;;
+    --reset)
+        if ask "Delete the Wine prefix at\n$WINEPREFIX ?"; then
+            "$WINESERVER" -k 2>/dev/null; rm -rf "$WINEPREFIX"; log "Prefix deleted."
+        fi ;;
+    -*)               usage; exit 2 ;;
+    *)
+        ensure_installed || exit 1
+        sync_patched_dlls
+        apply_dpi
+        check_usb 1
+        args=()
+        for a in "$@"; do
+            if [ -e "$a" ]; then args+=("$(to_win_path "$(readlink -f "$a")")"); else args+=("$a"); fi
+        done
+        cd "$CK_DIR" || exit 1
+        log "Starting $CK_EXE"
+        start=$SECONDS
+        "$WINE" "$CK_EXE" "${args[@]}" >>"$LOG" 2>&1
+        rc=$?
+        # Keep the AppImage mounted until every Wine process of this prefix is gone.
+        wine_wait
+        if [ $rc != 0 ] && [ $((SECONDS - start)) -lt 30 ]; then
+            error "The Connectivity Kit quit unexpectedly (exit code $rc).\n\nLog: $LOG"
+        fi
+        exit $rc ;;
+esac

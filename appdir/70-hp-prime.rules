@@ -1,0 +1,7 @@
+# HP Prime calculators – give the logged-in user access so the
+# HP Connectivity Kit (running in Wine via hidraw) can talk to them.
+#   03f0:0441  HP Prime (G1)
+#   03f0:2441  HP Prime G2 (2AP18AA)
+#   03f0:1541  reported on some older units
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="03f0", ATTRS{idProduct}=="0441|1541|2441", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="03f0", ATTR{idProduct}=="0441|1541|2441", MODE="0666", TAG+="uaccess"

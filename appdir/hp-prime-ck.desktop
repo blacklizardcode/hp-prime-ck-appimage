@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=HP Prime Connectivity Kit
+GenericName=Calculator Connectivity
+Comment=Transfer programs, apps and files to and from the HP Prime calculator (via Wine)
+Exec=AppRun %F
+Icon=hp-prime-ck
+Terminal=false
+Categories=Education;Math;Utility;
+Keywords=HP;Prime;calculator;connectivity;
+Actions=SetupUSB;CheckUSB;
+
+[Desktop Action SetupUSB]
+Name=Set up USB access for the HP Prime
+Exec=AppRun --setup-usb
+
+[Desktop Action CheckUSB]
+Name=Check HP Prime USB connection
+Exec=AppRun --check-usb
