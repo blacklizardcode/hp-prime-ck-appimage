@@ -40,11 +40,19 @@ jobs:
             SHA256SUMS
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" *.AppImage SHA256SUMS \
-            --title "HP Prime Connectivity Kit ${GITHUB_REF_NAME#v} (AppImage)" \
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            # manual run: tag from the CK version in the file name plus the run number, e.g. v2.4.2-3
+            ver="$(ls *.AppImage | sed -E 's/^HP_Prime_Connectivity_Kit-(.*)-x86_64\.AppImage$/\1/')"
+            tag="v${ver}-${GITHUB_RUN_NUMBER}"
+          fi
+          gh release create "$tag" *.AppImage SHA256SUMS --target "$GITHUB_SHA" \
+            --title "HP Prime Connectivity Kit ${tag#v} (AppImage)" \
             --notes "HP Connectivity Kit for Linux with bundled Wine. Install with Gear Lever: see the README.
+
           Built from ${GITHUB_SHA::7} by GitHub Actions."
