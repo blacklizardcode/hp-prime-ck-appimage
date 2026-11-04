@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # AppRun for the HP Prime Connectivity Kit AppImage.
 #
 # Runs HP's Windows Connectivity Kit through a bundled, portable Wine build.

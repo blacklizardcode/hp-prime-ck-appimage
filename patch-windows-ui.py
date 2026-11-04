@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Patch Wine's x86_64 windows.ui.dll so IUISettings2::get_TextScaleFactor works.
 
 Wine (11.0 .. 11.21 at least) implements it as a stub returning E_NOTIMPL. The HP Connectivity

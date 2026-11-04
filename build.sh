@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Build HP_Prime_Connectivity_Kit-<version>-x86_64.AppImage
 #
 # What goes in:
@@ -32,7 +33,7 @@ CACHE="$BUILD/cache"
 APPDIR="$BUILD/AppDir"
 CK_INSTALLER=""
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '/^# Build/,/^set -/{ /^#/p; }' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in

@@ -103,3 +103,15 @@ For a different CK version, also set `CK_SHA256=` (empty) to skip the pinned che
 * Talking to a **physical** calculator over USB under Wine is reported as working but sometimes glitchy on the HP forum. The user interface, program editing, and the virtual calculator are solid.
   If the calculator connects but its content shows up empty, unplug and re-plug it with the CK open, and make sure the calculator firmware is current.
 * x86_64 only.
+
+## License
+
+The scripts in this repository (`build.sh`, `appdir/AppRun`, `patch-windows-ui.py` and the other files here) are licensed under the [GNU General Public License v3.0](LICENSE).
+
+That doesn't cover the software the AppImage bundles or downloads:
+
+* The **HP Connectivity Kit** is proprietary HP software, under HP's own end-user licence agreement (shown on first start).
+* **Wine** is licensed under the LGPL 2.1 or later.
+* The **Microsoft Visual C++ runtime** is under Microsoft's licence terms.
+
+The released AppImages contain these as built from their official downloads, for personal use with your HP Prime.
